@@ -1,0 +1,92 @@
+The Core Loop You're Building
+For each layer:
+    drop it from K6/V4 → K4/V4 (or any lower config)
+    measure how much perplexity increases
+    call that number the "sensitivity" of that layer
+
+Sort layers by sensitivity.
+Allocate extra bits to high-sensitivity layers,
+take bits away from low-sensitivity layers,
+keep total budget constant.
+Measure whether this beats uniform allocation.
+That's the whole project. Everything below is how to actually execute each step cleanly.
+
+What You Need to Understand First
+TurboQuant's codebooks are precomputed per bit-width. The 4-bit codebook has 16 centroids optimized for the Beta distribution at 4-bit resolution. The 6-bit codebook has 64 centroids. These are different lookup tables. When you "switch" a layer from K6 to K4, you're not just rounding differently — you're using an entirely different set of centroids. This is what makes the engineering non-trivial and the result meaningful.
+The sensitivity metric is a proxy. You're not measuring the true optimal allocation — that would require evaluating all possible combinations, which is exponential. You're measuring a per-layer sensitivity score independently, then using it to guide allocation greedily. KVTuner does something similar with attention score error as the proxy. You'll use perplexity delta, which is noisier but doesn't require instrumentation inside the attention computation.
+GQA means your layer count and head count are separate. Qwen2.5-7B has 28 layers × 8 KV heads. When you "lower the bits for layer 5," you're changing the codebook for all 8 KV heads in that layer simultaneously. For the first pass, treat each layer as a single unit. Head-level allocation is a phase 2 extension.
+
+Step 1: Reproduce the Baseline
+Before you measure sensitivity of anything, you need a clean baseline number to compare against. This is the perplexity of the model running with uniform K6/V4 TurboQuant on every layer.
+What to do:
+
+Load Qwen2.5-7B-Instruct with the community TurboQuant implementation (tonbistudio repo)
+Configure it with K=6, V=4 across all layers
+Run perplexity on WikiText-2 test set (the standard ~287K token evaluation set)
+Record this number. Call it ppl_baseline
+
+What you'll see: A number close to the fp16 baseline perplexity. The tonbistudio readme shows K6/V4 achieves near-lossless quality on Qwen2.5-3B. On 7B it should be similar or slightly better. If your baseline is dramatically worse than fp16, something is wrong with your setup — fix it before moving on.
+Common pitfall: Make sure the residual window (the fp16 window for recent tokens) is configured the same way for all experiments. The tonbistudio V3 keeps the most recent N tokens in fp16. If N differs between runs, your perplexity numbers aren't comparable. Fix N=128 for all experiments.
+
+Step 2: Measure Per-Layer Sensitivity
+This is the core data collection step. For each layer i in 0..27:
+
+Keep all other layers at K6/V4
+Set layer i to K4/V4 (drop K bits by 2)
+Measure perplexity on the same WikiText-2 evaluation
+Record delta_ppl[i] = ppl_with_layer_i_lowered - ppl_baseline
+
+At the end you have 28 numbers. A large delta_ppl[i] means layer i is sensitive — lowering its bits hurts a lot. A small delta_ppl[i] means layer i is robust — you can safely lower its bits with little cost.
+What you'll see: The delta values will not be uniform. Based on KVTuner's findings on Qwen2.5-7B, you should expect middle layers (roughly 10-20) to have higher sensitivity than early and late layers. If all deltas are near-zero, your sensitivity metric isn't discriminating — try a larger bit drop (K6→K3) to amplify the signal.
+Practical note on compute: Each sensitivity measurement requires one full perplexity evaluation pass over WikiText-2. That's about 5-10 minutes per layer on an A100 for a 7B model. 28 layers × 10 minutes = ~5 hours. Run this overnight. You can parallelize by running multiple layer experiments in separate processes if you have memory headroom, but sequential is fine.
+Also measure V sensitivity separately: Run the same loop but drop V4→V3 while keeping K6 fixed. This gives you delta_ppl_v[i] separately. You'll likely find V sensitivity is lower than K sensitivity across all layers — this is the asymmetry the community already knows about, and reproducing it with TurboQuant's codebooks specifically is a contribution.
+
+Step 3: Visualize Before Allocating
+Before doing any adaptive allocation, plot your sensitivity numbers. This is Figure 1 of your paper and the most important thing to look at before writing more code.
+Plot: Bar chart, x-axis = layer index 0-27, y-axis = delta_ppl[i]. Color bars by whether the layer contains mostly retrieval heads or sink heads (you'll need head classification for this, but you can do a rough version using attention variance first — see below).
+What to look for:
+
+Are sensitive layers clustered in the middle? (Expected based on KVTuner)
+Do layers with high K-sensitivity also have high V-sensitivity, or do they decorrelate?
+Is the sensitivity distribution bimodal (clear high/low groups) or continuous? Bimodal is better — it means there's a natural threshold for adaptive allocation.
+
+Quick head type proxy (before running full DuoAttention classification): Run 20 diverse prompts, compute attention_to_position_0 / total_attention per layer averaged across heads. Layers where this ratio is high are sink-dominated. Overlay this on your bar chart. If sink-dominated layers cluster in the low-sensitivity region, you have your story.
+
+Step 4: Build the Greedy Allocator
+Now you have sensitivity scores. Use them to find a better allocation.
+The budget constraint: Uniform K6/V4 across 28 layers uses 28 × (6 + 4) = 280 total bit-layer units. Your adaptive allocation must also sum to 280. Every layer you upgrade (say K6→K8) must be offset by a layer you downgrade (K6→K4).
+The greedy algorithm:
+
+Start from uniform K6/V4 everywhere
+Find the layer with the lowest K-sensitivity (delta_ppl closest to zero)
+Drop it to K4. This saves 2 bit-layer units.
+Find the layer with the highest K-sensitivity
+Upgrade it to K8 (if the codebook exists) or keep it at K6. This spends 2 bit-layer units.
+Repeat until you've redistributed some fixed number of bit-layer units (say 20% of budget)
+Measure total perplexity of the resulting configuration
+
+Codebook availability check: TurboQuant's precomputed codebooks in the tonbistudio repo cover specific bit widths (check turboquant/codebooks/ directory). If K8 codebook doesn't exist, your max upgrade is K6 and you can only reallocate downward (save bits overall) rather than redistribute. That's actually fine — a budget-neutral reallocation that maintains the same total bits while improving quality is the cleanest result.
+What you'll see: One of three outcomes:
+
+Adaptive allocation beats uniform by > 0.1 perplexity points → strong result, proceed to paper
+Adaptive allocation beats uniform by 0.01-0.1 points → modest but real result, report it honestly
+No improvement → the greedy proxy doesn't work; try attention-logit error as sensitivity metric instead of perplexity delta
+
+
+Step 5: Validate and Compare
+Run your best adaptive configuration against the baselines on a proper evaluation set. Don't use WikiText-2 for this — you used it for sensitivity estimation, so testing on it would be in-sample. Use LongBench-E (the uniform-length subset the TurboQuant paper uses) and needle-in-a-haystack.
+Configurations to compare:
+
+fp16 (no compression) — ground truth ceiling
+Uniform K6/V4 — the standard TurboQuant baseline
+Your adaptive allocation — same total bits, redistributed
+Uniform K4/V4 — same average bits as your adaptive config (fairness check)
+
+Configuration 4 is the critical comparison that reviewers will ask for. If your adaptive K6/V4 (where some layers get K4 and some get K6+) performs better than uniform K4/V4 at the same average bits, you've shown that sensitivity-aware allocation extracts more quality per bit than naive uniform reduction.
+
+File Structure to Build
+Keep it simple. Three files to start:
+sensitivity.py — loops over layers, measures perplexity delta for each, saves results to sensitivity_scores.json
+allocate.py — takes sensitivity_scores.json as input, runs the greedy allocator, outputs layer_config.json mapping layer index to (k_bits, v_bits)
+evaluate.py — takes layer_config.json, runs the model with that configuration, reports perplexity and LongBench scores
+This separation matters: sensitivity collection is slow (GPU, overnight), allocation is fast (CPU, seconds), evaluation is medium (GPU, 1-2 hours). Keeping them separate means you can re-run allocation with different budget constraints without re-running the expensive sensitivity collection.
